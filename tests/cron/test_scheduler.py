@@ -5,10 +5,12 @@ import itertools
 import json
 import logging
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
+import cron.scheduler as scheduler
 from cron.scheduler import (
     SILENT_MARKER,
     _build_job_prompt,
@@ -22,6 +24,29 @@ from cron.scheduler import (
 from cron.scheduler_delivery import _resolve_origin, _send_media_via_adapter
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestExternalWorkerAcknowledgement:
+    def test_acknowledgement_becomes_visible_only_after_complete_json_write(
+        self, tmp_path, monkeypatch
+    ):
+        ack_path = tmp_path / "execution.ready"
+        execution_id = "execution-123"
+        expected = {"pid": os.getpid(), "execution_id": execution_id}
+        real_replace = os.replace
+
+        def publish_after_inspection(source, destination):
+            assert Path(destination) == ack_path
+            assert not ack_path.exists()
+            assert json.loads(Path(source).read_text(encoding="utf-8")) == expected
+            real_replace(source, destination)
+
+        monkeypatch.setattr(scheduler.os, "replace", publish_after_inspection)
+
+        scheduler._publish_external_worker_acknowledgement(ack_path, execution_id)
+
+        assert json.loads(ack_path.read_text(encoding="utf-8")) == expected
+        assert not list(tmp_path.glob("*.tmp"))
 
 
 class TestSummarizeCronFailureForDelivery:

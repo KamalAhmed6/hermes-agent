@@ -3288,6 +3288,32 @@ def _launch_external_cron_worker(job: dict) -> bool:
     )
 
 
+def _publish_external_worker_acknowledgement(ack_path: Path, execution_id: str) -> None:
+    """Publish a complete external-worker acknowledgement atomically.
+
+    The gateway treats existence of ``ack_path`` as permission to parse it.  Do
+    not create that public filename until its complete, flushed JSON payload is
+    ready; otherwise the gateway can observe a partial document and classify a
+    valid ownership handoff as uncertain.
+    """
+    ack_path.parent.mkdir(parents=True, exist_ok=True)
+    if ack_path.exists():
+        raise FileExistsError(f"acknowledgement already exists: {ack_path}")
+    temporary_ack_path = ack_path.with_name(
+        f".{ack_path.name}.{uuid.uuid4().hex}.tmp"
+    )
+    fd = os.open(temporary_ack_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as ack_file:
+            json.dump({"pid": os.getpid(), "execution_id": execution_id}, ack_file)
+            ack_file.flush()
+            os.fsync(ack_file.fileno())
+        os.replace(temporary_ack_path, ack_path)
+    except BaseException:
+        temporary_ack_path.unlink(missing_ok=True)
+        raise
+
+
 def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
     """Adopt and execute one gateway-dispatched cron payload.
 
@@ -3339,12 +3365,7 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 )
                 return False
             try:
-                ack_path.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(ack_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as ack_file:
-                    json.dump({"pid": os.getpid(), "execution_id": execution_id}, ack_file)
-                    ack_file.flush()
-                    os.fsync(ack_file.fileno())
+                _publish_external_worker_acknowledgement(ack_path, execution_id)
             except Exception:
                 logger.exception(
                     "Cron external worker could not publish ready acknowledgement for %s",
