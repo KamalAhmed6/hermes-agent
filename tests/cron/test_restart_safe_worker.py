@@ -177,6 +177,8 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
     )
     monkeypatch.setattr("cron.executions.adopt_claimed_execution", adopted)
     monkeypatch.setattr(scheduler, "run_one_job", run)
+    replace = Mock(wraps=scheduler.os.replace)
+    monkeypatch.setattr(scheduler.os, "replace", replace)
 
     assert scheduler._run_external_worker_payload(payload, ack) is True
 
@@ -187,6 +189,9 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
     assert observed_homes == [expected_home, expected_home]
     assert ack.exists()
     assert not payload.exists()
+    replace.assert_called_once()
+    assert replace.call_args.args[0] != ack
+    assert replace.call_args.args[1] == ack
 
 
 def test_external_worker_refuses_to_run_without_durable_ownership(

@@ -3338,14 +3338,26 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                     execution_id,
                 )
                 return False
+            ack_temporary_path = ack_path.with_name(
+                f".{ack_path.name}.{os.getpid()}.tmp"
+            )
             try:
                 ack_path.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(ack_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                fd = os.open(
+                    ack_temporary_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
                 with os.fdopen(fd, "w", encoding="utf-8") as ack_file:
                     json.dump({"pid": os.getpid(), "execution_id": execution_id}, ack_file)
                     ack_file.flush()
                     os.fsync(ack_file.fileno())
+                os.replace(ack_temporary_path, ack_path)
             except Exception:
+                try:
+                    ack_temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 logger.exception(
                     "Cron external worker could not publish ready acknowledgement for %s",
                     execution_id,
