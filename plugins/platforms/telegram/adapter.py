@@ -10,6 +10,7 @@ import os
 import html as _html
 import re
 import time
+import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
@@ -5902,6 +5903,168 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         return self._apply_telegram_group_observe_attribution(event)
 
+    # SafeCan command center controls are deliberately deterministic.  They are
+    # dispatched after Telegram authorization and before any model turn.  They
+    # expose operational signals only: none of these commands can create or
+    # close a project, approve completion, or perform a financial or external
+    # business action.
+    _SAFECAN_PROJECT_MAP = "/srv/safecan/hermes/project-operations/config/daily_whatsapp_project_map.json"
+    _SAFECAN_EOD_ROOT = "/srv/safecan/hermes/private-dashboard/v1/static/project-intelligence/eod-whatsapp-evidence"
+    _SAFECAN_DELEGATION_QUEUE = "/home/safecan-hermes/.hermes/safecan-command-center/delegations.jsonl"
+
+    @staticmethod
+    def _is_safecan_server_status_query(text: str) -> bool:
+        """Identify simple SafeCan connectivity questions without a model turn."""
+        normalized = " ".join((text or "").lower().split())
+        if normalized in {"/server", "/serverstatus", "/status"}:
+            return True
+        return "server" in normalized and any(
+            phrase in normalized
+            for phrase in ("connected", "connection", "online", "status", "working", "running")
+        )
+
+    @staticmethod
+    async def _safecan_systemd_state(*args: str, user_service: bool = False) -> str:
+        """Read one systemd service state without shell expansion or provider use."""
+        command = ["/usr/bin/systemctl"]
+        environment = None
+        if user_service:
+            command.append("--user")
+            environment = dict(os.environ)
+            environment.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        command.extend(("is-active", *args))
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=environment,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            return stdout.decode("utf-8", errors="replace").strip().splitlines()[0] if stdout else "unknown"
+        except Exception:
+            return "unknown"
+
+    async def _send_safecan_server_status(self, msg) -> None:
+        """Reply from the authoritative SafeCan service units without invoking a model."""
+        dashboard, collector, gateway = await asyncio.gather(
+            self._safecan_systemd_state("safecan-hermes-dashboard.service"),
+            self._safecan_systemd_state("safecan-whatsapp-collector-user.service", user_service=True),
+            self._safecan_systemd_state("hermes-gateway.service"),
+        )
+        states = (dashboard, collector, gateway)
+        labels = ("Dashboard", "WhatsApp collector", "Hermes gateway")
+        healthy = all(state == "active" for state in states)
+        heading = "✅ SafeCan server check: online" if healthy else "⚠️ SafeCan server check: attention needed"
+        details = "\n".join(f"{label}: {state}" for label, state in zip(labels, states))
+        content = f"{heading}\n{details}\n\nThis status is read directly from server services; no AI provider was used."
+        await self.send(str(msg.chat.id), content, reply_to=str(msg.message_id))
+
+    async def _send_safecan_command(self, msg, text: str) -> None:
+        """Deliver a deterministic SafeCan command-center response without a model turn."""
+        await self.send(str(msg.chat.id), text, reply_to=str(msg.message_id))
+
+    def _safecan_latest_report(self) -> str:
+        """Return the newest completed EOD evidence summary without inferring business completion."""
+        try:
+            root = _Path(self._SAFECAN_EOD_ROOT)
+            dates = sorted(
+                (child for child in root.iterdir() if child.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", child.name)),
+                reverse=True,
+            )
+            if not dates:
+                return "⚠️ No completed EOD evidence report is available yet."
+            summary = json.loads((dates[0] / "summary.json").read_text(encoding="utf-8"))
+            reports = summary.get("reports", [])
+            updates = sum(int(item.get("statement_count", 0) or 0) for item in reports if isinstance(item, dict))
+            photos = sum(int(item.get("media_message_count", 0) or 0) for item in reports if isinstance(item, dict))
+            return (
+                f"📊 SafeCan report — {summary.get('report_date', dates[0].name)}\n"
+                f"Evidence updates: {updates}\nPhoto-bearing messages: {photos}\n"
+                f"Chat reports: {len(reports)}\n\n"
+                "These are preserved field-evidence signals, not completion, billing, payroll, payout, or client-acceptance decisions."
+            )
+        except Exception:
+            return "⚠️ The latest EOD report is unavailable. Server health remains available through /status."
+
+    def _safecan_project_routing(self) -> str:
+        """Return configured project mappings without claiming they are active or complete."""
+        try:
+            mappings = json.loads(_Path(self._SAFECAN_PROJECT_MAP).read_text(encoding="utf-8"))
+            names = [str(item.get("project_name") or item.get("chat_name") or "Unnamed project") for item in mappings if isinstance(item, dict)]
+            preview = "\n".join(f"• {name}" for name in names[:8])
+            remainder = f"\n… plus {len(names) - 8} more" if len(names) > 8 else ""
+            return (
+                f"📁 SafeCan project routing\nConfigured WhatsApp project mappings: {len(names)}\n{preview}{remainder}\n\n"
+                "Configured mapping permits internal evidence capture only; it does not establish operational completion or financial status."
+            )
+        except Exception:
+            return "⚠️ Project-routing data is unavailable."
+
+    def _safecan_queue_summary(self) -> str:
+        """Show a compact, durable view of pending delegated work."""
+        path = _Path(self._SAFECAN_DELEGATION_QUEUE)
+        if not path.exists():
+            return "📥 Delegation queue is empty. Use /delegate <task> to create a reviewed work item."
+        items = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines()[-10:]:
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    items.append(item)
+        except Exception:
+            return "⚠️ Delegation queue is unreadable; no work was dispatched."
+        if not items:
+            return "📥 Delegation queue is empty."
+        rows = [f"• {item.get('job_id', 'UNKNOWN')} — {item.get('status', 'UNKNOWN')} — {item.get('task', 'Untitled')[:80]}" for item in items]
+        return "📥 SafeCan delegation queue\n" + "\n".join(rows)
+
+    def _enqueue_safecan_delegation(self, task: str) -> str:
+        """Persist a user-requested task; execution remains approval and capacity gated."""
+        path = _Path(self._SAFECAN_DELEGATION_QUEUE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        item = {
+            "job_id": f"SC-{uuid.uuid4().hex[:10].upper()}",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "task": task,
+            "status": "AI_ANALYSIS_PENDING",
+            "source": "telegram_command_center",
+            "boundary": "Queued only. No completion, billing, payout, payroll, client acceptance, or external action is authorized by this record.",
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(item, sort_keys=True) + "\n")
+        os.chmod(path, 0o600)
+        return item["job_id"]
+
+    async def _handle_safecan_command_center(self, msg, text: str) -> bool:
+        """Handle SafeCan controls before they enter the AI conversation loop."""
+        normalized = " ".join((text or "").strip().split())
+        lower = normalized.lower()
+        if self._is_safecan_server_status_query(normalized):
+            await self._send_safecan_server_status(msg)
+            return True
+        if lower in {"/help", "/safecan", "/commandcenter"}:
+            await self._send_safecan_command(msg, "🧭 SafeCan Command Center\n/status — live server health\n/reports — latest completed EOD evidence report\n/projects — configured WhatsApp project routing\n/queue — pending delegated work\n/delegate <task> — queue a reviewed AI work item")
+            return True
+        if lower == "/reports":
+            await self._send_safecan_command(msg, self._safecan_latest_report())
+            return True
+        if lower == "/projects":
+            await self._send_safecan_command(msg, self._safecan_project_routing())
+            return True
+        if lower == "/queue":
+            await self._send_safecan_command(msg, self._safecan_queue_summary())
+            return True
+        if lower.startswith("/delegate"):
+            task = normalized[len("/delegate"):].strip()
+            if not task:
+                await self._send_safecan_command(msg, "Usage: /delegate <specific SafeCan task>")
+                return True
+            job_id = self._enqueue_safecan_delegation(task)
+            await self._send_safecan_command(msg, f"📥 Delegation queued: {job_id}\nStatus: AI_ANALYSIS_PENDING\nNo external action will occur without the required approval.")
+            return True
+        return False
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text; buffers client-split chunks into one MessageEvent."""
         msg = self._effective_update_message(update)
@@ -5914,7 +6077,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return
         await self._ensure_forum_commands(update.message)
-        self._enqueue_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
+        event = await self._build_triggered_event(msg, update, MessageType.TEXT)
+        if await self._handle_safecan_command_center(msg, event.text or ""):
+            return
+        self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -5928,6 +6094,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(msg)
         event = await self._build_triggered_event(msg, update, MessageType.COMMAND)
+        if await self._handle_safecan_command_center(msg, event.text or ""):
+            return
         # A >4096-char command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
         # immediately would orphan them. Near-limit commands go through text batching.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
